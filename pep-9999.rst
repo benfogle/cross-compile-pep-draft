@@ -1,0 +1,326 @@
+PEP: 9999
+Title: Standardized Config Settings for Cross-Compiling
+Author: Benjamin Fogle <benfogle@gmail.com>
+Sponsor: TBD
+Discussions-To: TBD
+Status: Draft
+Type: Standards Track
+Content-Type: text/x-rst
+Created: 05-Sep-2021
+Post-History: 30-Aug-2002
+
+
+Abstract
+========
+
+Python is increasingly finding its way into devices beyond conventional
+desktops and servers. It is a frequent component of embedded systems on
+multiple operating systems, and it has deployed as part of apps for Android and
+iOS.
+
+One of Python's strengths is its ecosystem of third party packages. While
+installing pure-Python packages typically doesn't pose a problem on embedded or
+otherwise unconventional devices, extension modules need to be cross-compiled.
+Unfortunately, the dominant build mechanism for Python, ``distutils`` /
+``setuptools``, has not been designed with cross-compiling in mind, leading to
+several problems:
+
+1. **Many independent solutions**. For instance, `Yocto Linux`_ and `Buildroot`_,
+   two embedded system generators, both implement cross-compiling Python
+   packages in their own unique ways, relying on per-package recipes. `Kivy`_
+   has a similar, homegrown method. Tools such as `crossenv`_ have attempted to
+   provide a more generic solution, but are not perfect.
+
+2. **Reliance on implementation details**. On Linux, most solutions revolve
+   around setting the undocumented environment variable
+   ``_PYTHON_SYSCONFIGDATA_NAME`` to get the `sysconfig`_ module to report
+   information for the host system.
+
+3. **Reliance on emulation**. One common way of working around the lack of
+   support for cross-compiling is to build wheels under emulation using, e.g.,
+   Qemu. This is significantly slower than cross-compiling, and many supported
+   architectures (Windows on ARM, VxWorks, iOS) are not self-hosting.
+
+4. **Accumulation of small issues**. Many small issues have cropped up resulting
+   from the lack of support. Perhapse the most common issue is using hard coded
+   paths, such as when locating system libraries. At the time of writing,
+   ``manylinux`` support on ARM is determined in ``packaging`` by `examining
+   sys.executable`_. These things break under cross-compling, but it is an
+   impossible task to track down and fix every single odditiy wherever it may
+   appear. This is complicated by the fact that most packages do not explicitly
+   test cross-compling, and doing so is difficult.
+
+.. _frozen-versions:
+
+5. **Frozen versions**. Tools that have come to rely on per-package recipes
+   (such as Yocto, Buildroot, or Kivy, etc., mentioned above,) end up as
+   distributions: They provide a set of available packages locked at a specific
+   version number. Updating or adding new packages requires upstream support or
+   for the end user to replicate such work locally for the desired package and
+   all its dependencies.
+
+This PEP attempts to standardize the process of cross-compiling extension
+modules. It proposes several standardized keys for the ``config_settings``
+dictionary, defined in :pep:`517`, for the purposes of passing information
+relevant to cross-compiling to build backends.
+
+This PEP does not mandate support for cross-compiling. Frontends are not
+required to have an explicit method of enabling cross-compiling, and backends
+may return an error indicating cross-compiling is not supported.
+
+This PEP does not apply to cross-compiling Python itself or anything in the
+standard library. It applies only to :pep:`517` frontends and backends.
+
+.. _Yocto Linux: https://www.yoctoproject.org/
+.. _Buildroot: https://buildroot.org/
+.. _Kivy: https://kivy.org/
+.. _crossenv: https://github.com/benfogle/crossenv
+.. _sysconfig: https://docs.python.org/3/library/sysconfig.html
+.. _examining sys.executable: https://github.com/pypa/packaging/blob/21.0/packaging/_manylinux.py#L76
+
+
+Terminology
+===========
+
+The following terms are used throughout this PEP. These use the `GNU autotools
+terminology`_ used when cross-compiling CPython itself.
+
+* *build system* -- The machine building the extension module, (usually a conventional
+  desktop or server).
+* *host system* -- The machine on which the resulting module will run, (i.e., an
+  embedded device). "Target" is frequently used as a synonym for "host,"
+  although this usage differs from GNU terminology.
+
+.. _GNU autotools terminology: https://www.gnu.org/savannah-checkouts/gnu/autoconf/manual/autoconf-2.70/html_node/Specifying-Target-Triplets.html
+
+Host Triple
+===========
+
+The host triple (sometimes "target triple") is a concise description of the
+host system in a somewhat standard format. The term "triple" is a bit of a
+misnomer, because it may actually have between two and four components. This
+PEP adopts the `host triple format used by Clang`_.
+
+    <arch><sub>-<vendor>-<sys>-<abi>
+
+When a parameter is omitted, its value is ``"unknown"``. Unfortunately, there
+is no clear way to tell which parameter was omitted. If a backend does not
+recognize a paramter, it may use the value ``"unknown"`` in its place. This is
+consistent with Clang's behavior. The ``<sub>`` parameter is generally only
+seen on ARM (``v6m``, ``v7a``, etc.). The ``<vendor>`` field is typically of
+little use.
+
+There is no comprehensive list of supported host triples, which generally
+depends on the available toolchain(s). For common triples, we take examples
+from `Rust's supported platform list`_ (which in turn, is based on Clang
+triplets).  Below are some example:
+
+====================================== =======================================
+Host Triple                            Platform
+====================================== =======================================
+``x86_64-unknown-linux-gnu``           Linux on x86_64, glibc
+``aarch64-unknown-linux-gnu``          Linux on ARM64, glibc
+``armv7-unknown-linux-gnueabihf``      Linux on ARMv7, glibc, hardware floating
+                                       point support. (Ex: Raspberry Pi)
+``aarch64-unknown-linux-musl``         Linux on ARM64, MUSL libc.
+``x86_64-pc-windows-msvc``             64-bit Windows
+``i686-pc-windows-msvc``               32-bit Windows
+``aarch64-pc-windows-msvc``            ARM64 Windows
+``x86_64-apple-darwin``                64-bit MacOS
+``aarch64-apple-darwin``               ARM64 MacOS
+``x86_64-unknown-freebsd``             FreeBSD on x86_64
+``aarch64-linux-android``              Android on ARM64
+``aarch64-apple-ios``                  ARM64 iOS
+``aarch64-wrs-vxworks``                VxWorks on ARM64
+====================================== =======================================
+
+.. _host triple format used by Clang: https://clang.llvm.org/docs/CrossCompilation.html#target-triple
+.. _Rust's supported platform list: https://doc.rust-lang.org/nightly/rustc/platform-support.html
+
+
+Config Settings
+===============
+
+This PEP proposes the following keys be added to the `config_settings` dict
+defined in PEP 517. Keys are strings whose values should be accessed as::
+
+    config_settings.get("key", default)
+
+During a native build, none of these keys need be present. During a cross
+build, the only one the frontend MUST always supply is ``"host"``. However,
+backends MAY raise an exception if additional keys are required. Backends MAY
+emit warnings if any keys are not understood.
+
+It is up to the backend to determine if and how to use the values passed in
+``config_settings``. It is up to the backend on how to handle values it
+determines to be conflicting or overlapping.
+
+All keys defined here are prefixed with ``"system:"`` so that backends can
+easily distinguish PEP9999 settings from native settings.
+
+======================= =============== ==============================================
+Key                     Default         Description
+======================= =============== ==============================================
+``system:host``         ``"native"``    The host triple. A value other than
+                                        ``"native"`` indicates cross-compiling.
+``system:host_prefix``  ``None``        The prefix (as in `sys.prefix`_) of the host
+                                        Python installation. This may be useful for
+                                        the backend to further inspect details about
+                                        the host. It may be used to find
+                                        ``libpython``, ``python.h``, or on \*nix
+                                        systems, the Python makefile.
+``system:sysroot``      ``None``        The host sysroot, a folder on the build system
+                                        that acts as the logical root of the host
+                                        filesystem. Corresponds to ``--sysroot``
+                                        option on ``gcc`` and ``clang``.
+``system:platform_tag`` ``"auto"``      Override the platform tag. Most useful for
+                                        setting the ``manylinux`` platform tags, where
+                                        proper detection can be difficult when
+                                        cross-compiling. The special value ``"auto"``
+                                        indicates that the backend should detect the
+                                        platform tag as best it can.
+======================= =============== ==============================================
+
+The following additional tags are most relevent for C/C++ code. They are
+standardized here because these are common needs for cross-compiling. Even in
+languages such as Rust, which do not need C compile flags, having this
+information can be useful for build scripts (for instance, when using the `cc
+crate`_).  Although intended for C, if a non-C language can use these keys for
+its own purposes, it is free to do so. For example, Rust can sensibly make use
+of ``lib_dirs`` for finding crates. (But see `Interoperability`_ below.)
+
+======================= =============== ==============================================
+Key                     Default         Description
+======================= =============== ==============================================
+``system:include_dirs`` ``[]``          A list of directories to add to the include
+                                        search path.
+``system:lib_dirs``     ``[]``          A list of directories to add to the library
+                                        search path.
+``system:cc``           ``None``        A list of strings overriding the default C
+                                        compiler for the given host. Example:
+                                        ``["x86_64-linux-gnu-gcc", "-pthread"]``
+``system:c++``          ``None``        A list of strings overriding the default C++
+                                        compiler for the given host. Example:
+                                        ``["x86_64-linux-gnu-g++", "-pthread"]``
+``system:cflags``       ``[]``          A list of flags to pass when compiling C code.
+                                        These flags should already be split according
+                                        to the system's shell quoting rules.
+``system:cxxflags``     ``[]``          A list of flags to pass when compiling C++
+                                        code.  These flags should already be split
+                                        according to the system's shell quoting rules.
+``system:ldflags``      ``[]``          A list of flags to pass when linking.
+                                        These flags should already be split according
+                                        to the system's shell quoting rules.
+======================= =============== ==============================================
+
+.. _sys.prefix: https://docs.python.org/3/library/sys.html#sys.prefix
+.. _cc crate: https://crates.io/crates/cc
+
+Recommendations for Build Backends
+==================================
+
+Detecting Cross-Compiling
+-------------------------
+
+Backends should use the following logic to detect the presence of cross-compiling::
+
+    def is_cross_compiling(config_settings):
+        return config_settings.get('host', 'native') != 'native'
+
+Note that cross-compiling is assumed any time the host triple is not
+``"native"``, including if the host and build system triples are the same
+thing.
+
+Interoperability
+----------------
+
+Users may want to set up an environment that can build multiple packages,
+regardless of backend. Use cases would include generic CI solutions such as
+``cibuildwheel``, which have no knowledge of the packages or dependencies that
+they may be used to build. If satisfying multiple backends at once is not
+possible, then a recipe-per-package `distribution-like situation`__ is likely.
+As such backends should do their best to interoperate.
+
+__ frozen-versions_
+
+Backends may interoperate by ignoring prefixes in ``config_settings`` that they
+do not recognize. Backends are encouraged to publish their own prefixes as well
+and accept a prefixed version of their native settings. For example, a frontend
+may populate ``config_settings`` with the following information::
+
+    {
+        "system:host": "aarch64-unknown-linux-gnu",
+        "cmake:toolchain-file": "/path/to/arm64.cmake",
+        "meson:cross-file": "/path/to/arm64-cross.txt",
+    }
+
+A hypothetical CMake backend would interpret ``cmake:toolchain-file`` in the
+same way as if it had been given ``toolchain-file`` and ignore
+``meson:cross-file`` entirely. Similarly, a hypothetical Meson backend would
+use ``cross-file`` and ignore ``cmake:toolchain-file``. Both might understand
+(or ignore) ``system:host``.
+
+Build System Cross-files
+------------------------
+
+Some build systems require a file to define cross-compiling information. In
+Meson, this is called the `cross file`_. In CMake this is called the `toolchain
+file`_. Build backends should do their best to automatically provide such files
+so that users do not, in the common case, have to set up parameters for each
+backend that happens to be in use.
+
+.. _cross file: https://mesonbuild.com/Cross-compilation.html
+.. _toolchain file: https://cmake.org/cmake/help/latest/manual/cmake-toolchains.7.html#cross-compiling
+
+Exposing Cross-Compiling Settings to Build Dependencies
+-------------------------------------------------------
+
+Some backends, in particular ``setuptools``, allow projects to run arbitrary
+code at build time. Such code, whether in a ``setup.py`` or in a build
+dependency, may need to know cross-compiling information. One particular case
+would be the interoperation between ``setuptools`` and ``packaging.tags``. The
+latter module is responsible for generating ABI tags, which requires knowledge
+of the host system.
+
+It is up to the backend how to expose this information. One possibility would
+be the adoption of a module that can provide build information in place of the
+standard library ``sysconfig`` module.
+
+
+Common Build Information
+------------------------
+
+It may be helpful to define a common module that can read in
+``config_settings`` and return sane default C/C++ build flags for the given
+host. A module such as this would be helpful for the considerations listed
+above. It would also be helpful for parsing and normalizing host triples. Such
+a module might look something like::
+
+    import buildflags
+
+    def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+        buildflags.config(config_settings)
+        # All modules and subprocess will see common build information until
+        # the next call to buildflags.config
+        compiler = buildflags.cc
+        ...
+
+The standardization and use of such a module is left to the backends themselves.
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
+
+
+
+..
+   Local Variables:
+   mode: indented-text
+   indent-tabs-mode: nil
+   sentence-end-double-space: t
+   fill-column: 70
+   coding: utf-8
+   End:
